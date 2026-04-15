@@ -59,6 +59,10 @@ KNOWN_IMAGES: dict[str, dict] = {
         "url":  "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2",
         "user": "debian",
     },
+    "alpine-3.23.3": {
+        "url":  "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.3-x86_64-bios-cloudinit-r0.qcow2",
+        "user": "alpine",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -244,6 +248,8 @@ runcmd:
 hostname: {hostname}
 users:
   - name: {user}
+    passwd: '*'
+    lock_passwd: false
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
