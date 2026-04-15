@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""qvm — lightweight VM spawner using QEMU + cloud-init
+
+Commands:
+  start     Start a VM
+  stop      Stop a running VM
+  ssh       Open an SSH session (or run a command)
+  list/ls   List all VMs and their status
+  rm        Remove a VM (disk + state)
+  port      Print the SSH port for a VM
+  console   Tail the serial console log
+  fetch     Pre-download a base image
+
+Quick start:
+  qvm start myvm --share ~/work
+  qvm ssh myvm
+  qvm stop myvm
+  qvm rm myvm
+
+Inside the VM the shared directory is mounted at /mnt/shared (9p/virtio-fs).
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Paths / defaults
+# ---------------------------------------------------------------------------
+
+QVM_HOME    = Path(os.environ.get("QVM_HOME", "~/.qvm")).expanduser()
+IMAGES_DIR  = QVM_HOME / "images"
+VMS_DIR     = QVM_HOME / "vms"
+SSH_KEY     = QVM_HOME / "id_ed25519"
+
+DEFAULT_IMAGE  = "ubuntu-24.04"
+DEFAULT_MEMORY = 512   # MB
+DEFAULT_CPUS   = 1
+
+KNOWN_IMAGES: dict[str, dict] = {
+    "ubuntu-24.04": {
+        "url":  "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img",
+        "user": "ubuntu",
+    },
+    "ubuntu-22.04": {
+        "url":  "https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-amd64.img",
+        "user": "ubuntu",
+    },
+    "debian-12": {
+        "url":  "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2",
+        "user": "debian",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Tiny helpers
+# ---------------------------------------------------------------------------
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(*args, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(list(args), check=True, **kwargs)
+
+
+def find_free_port(start: int = 10022) -> int:
+    for port in range(start, 65535):
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    die("no free TCP port found")
+
+
+def ensure_dirs() -> None:
+    for d in (IMAGES_DIR, VMS_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_ssh_key() -> tuple[str, str]:
+    """Generate ~/.qvm/id_ed25519 if absent. Returns (private_path, pubkey)."""
+    ensure_dirs()
+    if not SSH_KEY.exists():
+        run("ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(SSH_KEY),
+            capture_output=True)
+    pub = SSH_KEY.with_suffix(".pub").read_text().strip()
+    return str(SSH_KEY), pub
+
+
+def check_qemu() -> None:
+    if not shutil.which("qemu-system-x86_64"):
+        die("qemu-system-x86_64 not found.\n"
+            "  Arch:   sudo pacman -S qemu-system-x86\n"
+            "  Debian: sudo apt install qemu-system-x86\n"
+            "  Fedora: sudo dnf install qemu-system-x86")
+
+
+def check_qemu_img() -> None:
+    if not shutil.which("qemu-img"):
+        die("qemu-img not found (install qemu-img or qemu-utils)")
+
+
+def kvm_available() -> bool:
+    kvm = Path("/dev/kvm")
+    return kvm.exists() and os.access(str(kvm), os.W_OK)
+
+# ---------------------------------------------------------------------------
+# VM state
+# ---------------------------------------------------------------------------
+
+def _vm_dir(name: str) -> Path:
+    return VMS_DIR / name
+
+
+def _state_file(name: str) -> Path:
+    return _vm_dir(name) / "state.json"
+
+
+def load_state(name: str) -> dict:
+    p = _state_file(name)
+    if not p.exists():
+        die(f"VM '{name}' not found")
+    return json.loads(p.read_text())
+
+
+def save_state(name: str, state: dict) -> None:
+    _state_file(name).write_text(json.dumps(state, indent=2))
+
+
+def is_running(name: str) -> bool:
+    try:
+        pid = load_state(name).get("pid")
+        if pid is None:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return False
+
+
+def all_vm_names() -> list[str]:
+    if not VMS_DIR.exists():
+        return []
+    return sorted(p.name for p in VMS_DIR.iterdir() if p.is_dir())
+
+# ---------------------------------------------------------------------------
+# Image management
+# ---------------------------------------------------------------------------
+
+def resolve_image(name_or_path: str) -> tuple[Path, dict]:
+    """Return (local_path, metadata). Downloads if needed."""
+    if name_or_path in KNOWN_IMAGES:
+        meta = KNOWN_IMAGES[name_or_path]
+        img = IMAGES_DIR / f"{name_or_path}.img"
+        if not img.exists():
+            _do_fetch(name_or_path, meta["url"], img)
+        return img, meta
+    p = Path(name_or_path)
+    if p.exists():
+        return p.resolve(), {"user": "ubuntu"}
+    die(f"Unknown image '{name_or_path}'.\n"
+        f"  Known images: {', '.join(KNOWN_IMAGES)}\n"
+        f"  Or pass a path to a local qcow2/img file.")
+
+
+def _do_fetch(label: str, url: str, dest: Path) -> None:
+    ensure_dirs()
+    tmp = dest.with_suffix(".tmp")
+    print(f"Fetching {label}")
+    print(f"  URL  : {url}")
+    print(f"  Dest : {dest}")
+    try:
+        def _progress(count, block, total):
+            done = count * block
+            pct  = min(100, done * 100 // total) if total > 0 else 0
+            mb   = done / 1024 / 1024
+            print(f"\r  {pct:3d}%  {mb:.1f} MB", end="", flush=True)
+
+        urllib.request.urlretrieve(url, tmp, reporthook=_progress)
+        print()
+        tmp.rename(dest)
+        print("Done.")
+    except Exception as exc:
+        tmp.unlink(missing_ok=True)
+        die(f"download failed: {exc}")
+
+# ---------------------------------------------------------------------------
+# Cloud-init seed ISO
+# ---------------------------------------------------------------------------
+
+def _make_seed_iso(vm_d: Path, hostname: str, pubkey: str,
+                   user: str, has_share: bool) -> Path:
+    seed_dir = vm_d / "seed"
+    seed_dir.mkdir(exist_ok=True)
+
+    (seed_dir / "meta-data").write_text(
+        f"instance-id: {hostname}\nlocal-hostname: {hostname}\n"
+    )
+
+    share_setup = ""
+    if has_share:
+        share_setup = """
+# Mount the virtio-9p shared directory
+runcmd:
+  - mkdir -p /mnt/shared
+  - mount -t 9p -o trans=virtio,version=9p2000.L shared /mnt/shared
+  - echo 'shared /mnt/shared 9p trans=virtio,version=9p2000.L,_netdev 0 0' >> /etc/fstab
+"""
+
+    (seed_dir / "user-data").write_text(f"""\
+#cloud-config
+hostname: {hostname}
+users:
+  - name: {user}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - {pubkey}
+ssh_pwauth: false
+growpart:
+  mode: auto
+  devices: ['/']
+resize_rootfs: true
+package_update: false
+package_upgrade: false
+{share_setup}""")
+
+    seed_iso = vm_d / "seed.iso"
+
+    # Try ISO creation tools in order of preference
+    if shutil.which("cloud-localds"):
+        run("cloud-localds", str(seed_iso),
+            str(seed_dir / "user-data"), str(seed_dir / "meta-data"),
+            capture_output=True)
+        return seed_iso
+
+    for tool in ("genisoimage", "mkisofs"):
+        if shutil.which(tool):
+            run(tool,
+                "-output", str(seed_iso),
+                "-volid", "cidata",
+                "-joliet", "-rock",
+                str(seed_dir / "user-data"),
+                str(seed_dir / "meta-data"),
+                capture_output=True)
+            return seed_iso
+
+    if shutil.which("xorriso"):
+        run("xorriso", "-as", "mkisofs",
+            "-output", str(seed_iso),
+            "-volid", "cidata",
+            "-joliet", "-rock",
+            str(seed_dir / "user-data"),
+            str(seed_dir / "meta-data"),
+            capture_output=True)
+        return seed_iso
+
+    die(
+        "No ISO tool found. Install one of:\n"
+        "  cloud-utils (cloud-localds)\n"
+        "  genisoimage / mkisofs\n"
+        "  xorriso\n"
+        "\n"
+        "  Arch:   sudo pacman -S libisoburn\n"
+        "  Debian: sudo apt install genisoimage\n"
+        "  Fedora: sudo dnf install genisoimage"
+    )
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_start(args) -> None:
+    check_qemu()
+    check_qemu_img()
+
+    name = args.name
+    d    = _vm_dir(name)
+
+    if d.exists() and is_running(name):
+        die(f"VM '{name}' is already running. Use 'qvm stop {name}' first.")
+
+    d.mkdir(parents=True, exist_ok=True)
+    ensure_dirs()
+
+    priv_key, pubkey = ensure_ssh_key()
+    base_img, meta   = resolve_image(args.image)
+    user             = meta["user"]
+
+    # Copy-on-write overlay (keeps base image pristine)
+    overlay = d / "disk.qcow2"
+    if not overlay.exists():
+        run("qemu-img", "create",
+            "-f", "qcow2",
+            "-b", str(base_img),
+            "-F", "qcow2",
+            str(overlay),
+            capture_output=True)
+
+    has_share = bool(args.share)
+    seed_iso  = _make_seed_iso(d, name, pubkey, user, has_share)
+    ssh_port  = find_free_port(10022)
+    use_kvm   = kvm_available()
+
+    # ---- QEMU command ----
+    cmd: list[str] = ["qemu-system-x86_64"]
+
+    if use_kvm:
+        cmd += ["-enable-kvm", "-cpu", "host"]
+    else:
+        cmd += ["-cpu", "max"]
+        print("warning: /dev/kvm not available — boot will be slower")
+
+    cmd += [
+        "-m",   str(args.memory),
+        "-smp", str(args.cpus),
+        # Headless
+        "-display", "none",
+        # Serial console → log file
+        "-serial", f"file:{d / 'console.log'}",
+        # Main disk (overlay)
+        "-drive", f"file={overlay},if=virtio,cache=writeback,discard=unmap",
+        # Cloud-init seed (read-only)
+        "-drive", f"file={seed_iso},if=virtio,format=raw,readonly=on",
+        # Network — host-only user-mode with SSH forward
+        "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
+        "-device", "virtio-net-pci,netdev=net0",
+        # Entropy
+        "-device", "virtio-rng-pci",
+        # Balloon driver (allows host to reclaim memory)
+        "-device", "virtio-balloon",
+    ]
+
+    if has_share:
+        share_path = Path(args.share).resolve()
+        share_path.mkdir(parents=True, exist_ok=True)
+        cmd += [
+            "-virtfs",
+            f"local,path={share_path},mount_tag=shared,"
+            f"security_model=mapped-xattr,id=shared0",
+        ]
+
+    print(f"Starting VM '{name}'")
+    print(f"  image   : {args.image}")
+    print(f"  memory  : {args.memory} MB")
+    print(f"  cpus    : {args.cpus}")
+    print(f"  kvm     : {'yes' if use_kvm else 'no'}")
+    print(f"  ssh     : ssh -p {ssh_port} {user}@127.0.0.1")
+    if has_share:
+        share_abs = Path(args.share).resolve()
+        print(f"  share   : {share_abs}  →  /mnt/shared")
+    print(f"  console : {d / 'console.log'}")
+
+    with open(d / "qemu.log", "w") as qlog:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=qlog,
+            stderr=qlog,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    save_state(name, {
+        "pid":      proc.pid,
+        "ssh_port": ssh_port,
+        "ssh_user": user,
+        "ssh_key":  priv_key,
+        "image":    args.image,
+        "memory":   args.memory,
+        "cpus":     args.cpus,
+        "share":    str(Path(args.share).resolve()) if has_share else None,
+        "started":  time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+
+    # Wait for SSH
+    print("Waiting for SSH", end="", flush=True)
+    deadline = time.time() + 180
+    ready = False
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", ssh_port), timeout=2):
+                ready = True
+                break
+        except OSError:
+            print(".", end="", flush=True)
+            time.sleep(3)
+
+    print()
+    if ready:
+        print(f"Ready!  Connect with:  qvm ssh {name}")
+    else:
+        print(f"warning: SSH did not respond in time — check {d / 'console.log'}")
+
+
+def cmd_stop(args) -> None:
+    name = args.name
+    if not is_running(name):
+        print(f"VM '{name}' is not running.")
+        return
+    pid = load_state(name)["pid"]
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(30):
+            time.sleep(0.5)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    print(f"Stopped '{name}'.")
+
+
+def cmd_ssh(args) -> None:
+    name = args.name
+    if not is_running(name):
+        die(f"VM '{name}' is not running.")
+    st = load_state(name)
+    # Strip leading '--' that argparse may leave in REMAINDER
+    extra = args.cmd
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    ssh_cmd = [
+        "ssh",
+        "-i", st["ssh_key"],
+        "-p", str(st["ssh_port"]),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        f"{st['ssh_user']}@127.0.0.1",
+    ] + extra
+    os.execvp("ssh", ssh_cmd)
+
+
+def cmd_list(_args) -> None:
+    names = all_vm_names()
+    if not names:
+        print("No VMs.")
+        return
+    fmt = f"{'NAME':<20} {'STATUS':<10} {'PORT':<8} {'IMAGE':<20} {'STARTED'}"
+    print(fmt)
+    print("-" * len(fmt))
+    for name in names:
+        try:
+            st     = load_state(name)
+            status = "running" if is_running(name) else "stopped"
+            port   = str(st.get("ssh_port", "-"))
+            image  = st.get("image", "-")
+            started = st.get("started", "-")
+        except SystemExit:
+            status, port, image, started = "unknown", "-", "-", "-"
+        print(f"{name:<20} {status:<10} {port:<8} {image:<20} {started}")
+
+
+def cmd_rm(args) -> None:
+    name = args.name
+    if is_running(name):
+        if not args.force:
+            die(f"VM '{name}' is running. Use --force to stop and remove it.")
+        cmd_stop(args)
+    d = _vm_dir(name)
+    if d.exists():
+        shutil.rmtree(d)
+        print(f"Removed '{name}'.")
+    else:
+        die(f"VM '{name}' not found.")
+
+
+def cmd_port(args) -> None:
+    st = load_state(args.name)
+    print(st.get("ssh_port", "unknown"))
+
+
+def cmd_console(args) -> None:
+    log = _vm_dir(args.name) / "console.log"
+    if not log.exists():
+        die(f"No console log for '{args.name}'.")
+    os.execvp("tail", ["tail", "-f", str(log)])
+
+
+def cmd_fetch(args) -> None:
+    name = args.name
+    if name in KNOWN_IMAGES:
+        url  = args.url or KNOWN_IMAGES[name]["url"]
+        dest = IMAGES_DIR / f"{name}.img"
+    elif args.url:
+        dest = IMAGES_DIR / name
+    else:
+        die(f"Unknown image '{name}'. Pass --url to fetch a custom image.\n"
+            f"Known: {', '.join(KNOWN_IMAGES)}")
+    ensure_dirs()
+    _do_fetch(name, args.url or KNOWN_IMAGES[name]["url"], dest)
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="qvm",
+        description="Spawn lightweight QEMU VMs quickly.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = p.add_subparsers(dest="command", metavar="COMMAND")
+
+    # start
+    ps = sub.add_parser("start", help="Start a new VM")
+    ps.add_argument("name", help="VM name (used as hostname)")
+    ps.add_argument("--image", "-i", default=DEFAULT_IMAGE,
+                    help=f"Image name or path to local qcow2 (default: {DEFAULT_IMAGE})")
+    ps.add_argument("--share", "-s", metavar="DIR",
+                    help="Host directory to expose inside VM at /mnt/shared")
+    ps.add_argument("--memory", "-m", type=int, default=DEFAULT_MEMORY,
+                    metavar="MB", help=f"RAM in MB (default: {DEFAULT_MEMORY})")
+    ps.add_argument("--cpus", "-c", type=int, default=DEFAULT_CPUS,
+                    help=f"vCPU count (default: {DEFAULT_CPUS})")
+    ps.set_defaults(func=cmd_start)
+
+    # stop
+    pp = sub.add_parser("stop", help="Stop a running VM")
+    pp.add_argument("name")
+    pp.set_defaults(func=cmd_stop)
+
+    # ssh
+    psh = sub.add_parser("ssh", help="Open SSH session (or run a command)")
+    psh.add_argument("name")
+    psh.add_argument("cmd", nargs=argparse.REMAINDER,
+                     metavar="[-- CMD ...]",
+                     help="Optional command to run over SSH")
+    psh.set_defaults(func=cmd_ssh)
+
+    # list / ls
+    for alias in ("list", "ls"):
+        pl = sub.add_parser(alias, help="List VMs")
+        pl.set_defaults(func=cmd_list)
+
+    # rm
+    pr = sub.add_parser("rm", help="Remove a VM")
+    pr.add_argument("name")
+    pr.add_argument("--force", "-f", action="store_true",
+                    help="Stop the VM if running before removing")
+    pr.set_defaults(func=cmd_rm)
+
+    # port
+    ppo = sub.add_parser("port", help="Print SSH port for a VM")
+    ppo.add_argument("name")
+    ppo.set_defaults(func=cmd_port)
+
+    # console
+    pco = sub.add_parser("console", help="Tail the VM serial console log")
+    pco.add_argument("name")
+    pco.set_defaults(func=cmd_console)
+
+    # fetch
+    pf = sub.add_parser("fetch", help="Pre-download a base image")
+    pf.add_argument("name",
+                    help=f"Image name ({', '.join(KNOWN_IMAGES)}) or custom filename")
+    pf.add_argument("--url", help="Download URL (required for custom names)")
+    pf.set_defaults(func=cmd_fetch)
+
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args   = parser.parse_args()
+
+    if not hasattr(args, "func"):
+        parser.print_help()
+        sys.exit(0)
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
