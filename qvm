@@ -63,6 +63,10 @@ KNOWN_IMAGES: dict[str, dict] = {
         "url":  "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.3-x86_64-bios-cloudinit-r0.qcow2",
         "user": "alpine",
     },
+    "arch-latest": {
+        "url":  "https://mirror.dkm.cz/archlinux/images/latest/Arch-Linux-x86_64-cloudimg.qcow2",
+        "user": "arch",
+    },
 }
 
 # ---------------------------------------------------------------------------
