@@ -113,6 +113,15 @@ def check_qemu_img() -> None:
         die("qemu-img not found (install qemu-img or qemu-utils)")
 
 
+def find_virtiofsd() -> Optional[str]:
+    """Return path to virtiofsd if found, else None."""
+    # Rust standalone package installs to PATH; C legacy lives under /usr/lib/qemu/
+    for candidate in (shutil.which("virtiofsd"), "/usr/lib/qemu/virtiofsd", "/usr/lib/virtiofsd"):
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
 def kvm_available() -> bool:
     kvm = Path("/dev/kvm")
     return kvm.exists() and os.access(str(kvm), os.W_OK)
@@ -202,7 +211,8 @@ def _do_fetch(label: str, url: str, dest: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _make_seed_iso(vm_d: Path, hostname: str, pubkey: str,
-                   user: str, has_share: bool) -> Path:
+                   user: str, has_share: bool,
+                   share_type: str = "9p") -> Path:
     seed_dir = vm_d / "seed"
     seed_dir.mkdir(exist_ok=True)
 
@@ -212,7 +222,16 @@ def _make_seed_iso(vm_d: Path, hostname: str, pubkey: str,
 
     share_setup = ""
     if has_share:
-        share_setup = """
+        if share_type == "virtiofs":
+            share_setup = """
+# Mount the virtiofs shared directory
+runcmd:
+  - mkdir -p /mnt/shared
+  - mount -t virtiofs shared /mnt/shared
+  - echo 'shared /mnt/shared virtiofs defaults,_netdev 0 0' >> /etc/fstab
+"""
+        else:
+            share_setup = """
 # Mount the virtio-9p shared directory
 runcmd:
   - mkdir -p /mnt/shared
@@ -310,10 +329,19 @@ def cmd_start(args) -> None:
             str(overlay),
             capture_output=True)
 
-    has_share = bool(args.share)
-    seed_iso  = _make_seed_iso(d, name, pubkey, user, has_share)
-    ssh_port  = find_free_port(10022)
-    use_kvm   = kvm_available()
+    has_share  = bool(args.share)
+    virtiofsd  = find_virtiofsd() if has_share else None
+    share_type = getattr(args, "share_type", "auto")
+    if share_type == "auto":
+        share_type = "virtiofs" if virtiofsd else "9p"
+    elif share_type == "virtiofs" and not virtiofsd:
+        die("virtiofsd not found.\n"
+            "  Arch:   sudo pacman -S virtiofsd\n"
+            "  Debian: sudo apt install virtiofsd\n"
+            "  Fedora: sudo dnf install virtiofsd")
+    seed_iso   = _make_seed_iso(d, name, pubkey, user, has_share, share_type)
+    ssh_port   = find_free_port(10022)
+    use_kvm    = kvm_available()
 
     # ---- QEMU command ----
     cmd: list[str] = ["qemu-system-x86_64"]
@@ -344,14 +372,39 @@ def cmd_start(args) -> None:
         "-device", "virtio-balloon",
     ]
 
+    virtiofsd_proc = None
     if has_share:
         share_path = Path(args.share).resolve()
         share_path.mkdir(parents=True, exist_ok=True)
-        cmd += [
-            "-virtfs",
-            f"local,path={share_path},mount_tag=shared,"
-            f"security_model=mapped-xattr,id=shared0",
-        ]
+        if share_type == "virtiofs":
+            sock = d / "virtiofsd.sock"
+            sock.unlink(missing_ok=True)
+            virtiofsd_proc = subprocess.Popen(
+                [virtiofsd, f"--socket-path={sock}",
+                 f"--shared-dir={share_path}", "--cache=auto"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            # Wait for the socket to appear (virtiofsd must be ready before QEMU)
+            deadline_vfs = time.time() + 10
+            while not sock.exists() and time.time() < deadline_vfs:
+                time.sleep(0.1)
+            if not sock.exists():
+                die("virtiofsd did not create its socket in time")
+            cmd += [
+                "-chardev", f"socket,id=char0,path={sock}",
+                "-device", "vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=shared",
+                # virtiofs (vhost-user) requires shared memory
+                "-object", f"memory-backend-memfd,id=mem,size={args.memory}M,share=on",
+                "-numa", "node,memdev=mem",
+            ]
+        else:
+            cmd += [
+                "-virtfs",
+                f"local,path={share_path},mount_tag=shared,"
+                f"security_model=mapped-xattr,id=shared0",
+            ]
 
     print(f"Starting VM '{name}'")
     print(f"  image   : {args.image}")
@@ -361,7 +414,7 @@ def cmd_start(args) -> None:
     print(f"  ssh     : ssh -p {ssh_port} {user}@127.0.0.1")
     if has_share:
         share_abs = Path(args.share).resolve()
-        print(f"  share   : {share_abs}  →  /mnt/shared")
+        print(f"  share   : {share_abs}  →  /mnt/shared  ({share_type})")
     print(f"  console : {d / 'console.log'}")
 
     with open(d / "qemu.log", "w") as qlog:
@@ -374,15 +427,17 @@ def cmd_start(args) -> None:
         )
 
     save_state(name, {
-        "pid":      proc.pid,
-        "ssh_port": ssh_port,
-        "ssh_user": user,
-        "ssh_key":  priv_key,
-        "image":    args.image,
-        "memory":   args.memory,
-        "cpus":     args.cpus,
-        "share":    str(Path(args.share).resolve()) if has_share else None,
-        "started":  time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "pid":           proc.pid,
+        "ssh_port":      ssh_port,
+        "ssh_user":      user,
+        "ssh_key":       priv_key,
+        "image":         args.image,
+        "memory":        args.memory,
+        "cpus":          args.cpus,
+        "share":         str(Path(args.share).resolve()) if has_share else None,
+        "share_type":    share_type if has_share else None,
+        "virtiofsd_pid": virtiofsd_proc.pid if virtiofsd_proc else None,
+        "started":       time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
 
     # Wait for SSH
@@ -410,7 +465,8 @@ def cmd_stop(args) -> None:
     if not is_running(name):
         print(f"VM '{name}' is not running.")
         return
-    pid = load_state(name)["pid"]
+    st  = load_state(name)
+    pid = st["pid"]
     try:
         os.kill(pid, signal.SIGTERM)
         for _ in range(30):
@@ -423,6 +479,13 @@ def cmd_stop(args) -> None:
             os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    # Stop virtiofsd if it was started alongside this VM
+    vfsd_pid = st.get("virtiofsd_pid")
+    if vfsd_pid:
+        try:
+            os.kill(vfsd_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     print(f"Stopped '{name}'.")
 
 
@@ -526,6 +589,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"Image name or path to local qcow2 (default: {DEFAULT_IMAGE})")
     ps.add_argument("--share", "-s", metavar="DIR",
                     help="Host directory to expose inside VM at /mnt/shared")
+    ps.add_argument("--share-type", choices=["auto", "virtiofs", "9p"],
+                    default="auto", dest="share_type",
+                    help="Filesystem to use for --share (default: auto — virtiofs if "
+                         "virtiofsd is present, else 9p)")
     ps.add_argument("--memory", "-m", type=int, default=DEFAULT_MEMORY,
                     metavar="MB", help=f"RAM in MB (default: {DEFAULT_MEMORY})")
     ps.add_argument("--cpus", "-c", type=int, default=DEFAULT_CPUS,
