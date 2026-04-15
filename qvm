@@ -332,12 +332,16 @@ def cmd_start(args) -> None:
     # Copy-on-write overlay (keeps base image pristine)
     overlay = d / "disk.qcow2"
     if not overlay.exists():
-        run("qemu-img", "create",
+        qemu_img_cmd = [
+            "qemu-img", "create",
             "-f", "qcow2",
             "-b", str(base_img),
             "-F", "qcow2",
             str(overlay),
-            capture_output=True)
+        ]
+        if args.disk_size:
+            qemu_img_cmd.append(args.disk_size)
+        run(*qemu_img_cmd, capture_output=True)
 
     has_share  = bool(args.share)
     virtiofsd  = find_virtiofsd() if has_share else None
@@ -614,6 +618,9 @@ def build_parser() -> argparse.ArgumentParser:
                     metavar="MB", help=f"RAM in MB (default: {DEFAULT_MEMORY})")
     ps.add_argument("--cpus", "-c", type=int, default=DEFAULT_CPUS,
                     help=f"vCPU count (default: {DEFAULT_CPUS})")
+    ps.add_argument("--disk-size", "-d", metavar="SIZE",
+                    help="Virtual disk size (e.g. 20G, 50G). "
+                         "Defaults to the base image size if unset.")
     ps.set_defaults(func=cmd_start)
 
     # stop
