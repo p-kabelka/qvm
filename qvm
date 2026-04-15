@@ -379,9 +379,16 @@ def cmd_start(args) -> None:
         if share_type == "virtiofs":
             sock = d / "virtiofsd.sock"
             sock.unlink(missing_ok=True)
+            host_uid = os.getuid()
+            host_gid = os.getgid()
+            # Map the host user's UID/GID to the VM default user (always 1000
+            # in standard cloud images) so shared files are accessible without
+            # modifying ownership or permissions on the host.
             virtiofsd_proc = subprocess.Popen(
                 [virtiofsd, f"--socket-path={sock}",
-                 f"--shared-dir={share_path}", "--cache=auto"],
+                 f"--shared-dir={share_path}", "--cache=auto",
+                 f"--uid-map=:1000:{host_uid}:1:",
+                 f"--gid-map=:1000:{host_gid}:1:"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
