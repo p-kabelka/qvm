@@ -378,7 +378,7 @@ def cmd_start(args) -> None:
         # Cloud-init seed (read-only)
         "-drive", f"file={seed_iso},if=virtio,format=raw,readonly=on",
         # Network — host-only user-mode with SSH forward
-        "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
+        "-netdev", f"user,id=net0,{'restrict=on,' if args.no_internet else ''}hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
         "-device", "virtio-net-pci,netdev=net0",
         # Entropy
         "-device", "virtio-rng-pci",
@@ -432,6 +432,7 @@ def cmd_start(args) -> None:
     print(f"  memory  : {args.memory} MB")
     print(f"  cpus    : {args.cpus}")
     print(f"  kvm     : {'yes' if use_kvm else 'no'}")
+    print(f"  network : {'ssh-only (no internet)' if args.no_internet else 'full'}")
     print(f"  ssh     : ssh -p {ssh_port} {user}@127.0.0.1")
     if has_share:
         share_abs = Path(args.share).resolve()
@@ -457,6 +458,7 @@ def cmd_start(args) -> None:
         "cpus":          args.cpus,
         "share":         str(Path(args.share).resolve()) if has_share else None,
         "share_type":    share_type if has_share else None,
+        "no_internet":   args.no_internet,
         "virtiofsd_pid": virtiofsd_proc.pid if virtiofsd_proc else None,
         "started":       time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
@@ -621,6 +623,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--disk-size", "-d", metavar="SIZE",
                     help="Virtual disk size (e.g. 20G, 50G). "
                          "Defaults to the base image size if unset.")
+    ps.add_argument("--no-internet", action="store_true",
+                    help="Restrict VM network to SSH only (no outbound internet access)")
     ps.set_defaults(func=cmd_start)
 
     # stop
