@@ -130,9 +130,17 @@ def find_virtiofsd() -> Optional[str]:
     return None
 
 
-def kvm_available() -> bool:
+def get_accel() -> Optional[str]:
+    """Return the best available hardware acceleration type, or None (TCG fallback)."""
+    if sys.platform == "darwin":
+        return "hvf"
+    if sys.platform == "win32":
+        return "whpx"
+    # Linux: check for KVM
     kvm = Path("/dev/kvm")
-    return kvm.exists() and os.access(str(kvm), os.W_OK)
+    if kvm.exists() and os.access(str(kvm), os.W_OK):
+        return "kvm"
+    return None
 
 # ---------------------------------------------------------------------------
 # VM state
@@ -354,21 +362,20 @@ def cmd_start(args) -> None:
             "  Debian: sudo apt install virtiofsd\n"
             "  Fedora: sudo dnf install virtiofsd")
     seed_iso   = _make_seed_iso(d, name, pubkey, user, has_share, share_type)
-    ssh_port   = find_free_port(10022)
-    use_kvm    = kvm_available()
+    ssh_port = find_free_port(10022)
+    accel    = get_accel()
 
     # ---- QEMU command ----
     cmd: list[str] = ["qemu-system-x86_64"]
 
-    if use_kvm:
-        cmd += ["-enable-kvm", "-cpu", "host"]
+    if accel:
+        cmd += ["-accel", accel, "-cpu", "host"]
     else:
         cmd += ["-cpu", "max"]
-        print("warning: /dev/kvm not available — boot will be slower")
-
-    cmd += ["-M", "q35"]
+        print("warning: no hardware acceleration available — boot will be slower")
 
     cmd += [
+        "-M", "q35"
         "-m",   str(args.memory),
         "-smp", str(args.cpus),
         # Headless
@@ -433,7 +440,7 @@ def cmd_start(args) -> None:
     print(f"  image   : {args.image}")
     print(f"  memory  : {args.memory} MB")
     print(f"  cpus    : {args.cpus}")
-    print(f"  kvm     : {'yes' if use_kvm else 'no'}")
+    print(f"  accel   : {accel or 'none (tcg)'}")
     print(f"  network : {'ssh-only (no internet)' if args.no_internet else 'full'}")
     print(f"  ssh     : ssh -p {ssh_port} {user}@127.0.0.1")
     if has_share:
